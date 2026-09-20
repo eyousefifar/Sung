@@ -14,8 +14,10 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QVector>
 #include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -38,6 +40,13 @@ static std::shared_ptr<QTemporaryDir> audioDirectory() {
   // Use the application cache filesystem instead of /tmp, which is commonly
   // tmpfs on CachyOS. QTemporaryDir still removes each file on normal teardown.
   return std::make_shared<QTemporaryDir>(root+"/audio-XXXXXX");
+}
+static QString audioStoreRoot() {
+  return QStandardPaths::writableLocation(QStandardPaths::CacheLocation)+"/audio-store";
+}
+static QString safeAudioSegment(QString s) {
+  for(QChar &c:s)if(!(c.isLetterOrNumber()||c==QLatin1Char('-')||c==QLatin1Char('_')||c==QLatin1Char('.')))c=QLatin1Char('_');
+  return s.isEmpty()?QStringLiteral("_"):s;
 }
 static QString itemId(const QVariant &v) {
   return v.toMap().value("id").toString();
@@ -638,17 +647,123 @@ void Backend::recoverStream() {
   const auto token=m_trackToken;
   QTimer::singleShot(0,this,[this,token]{if(m_wantPlay && token==m_trackToken){m_media().stop();m_media().setSource({});resolveCurrent(true);}});
 }
+void Backend::setRememberStreamedAudio(bool enabled) {
+  if(rememberStreamedAudio()==enabled)return;
+  m_settings.setValue("rememberStreamedAudio",enabled);emit settingsChanged();
+}
+void Backend::setStreamedAudioCacheMb(int megabytes) {
+  const auto value=qBound(64,megabytes,4096);
+  if(streamedAudioCacheMb()==value)return;
+  m_settings.setValue("streamedAudioCacheMb",value);emit settingsChanged();
+  pruneStreamedAudio();
+}
+QString Backend::streamedAudioKey(const QVariantMap &track) const {
+  if(isServerSource(track.value("source"))){
+    const auto source=track.value("source").toString();
+    const auto server=track.value("server").toString();
+    const auto remote=track.value("remoteId").toString();
+    if(source.isEmpty()||remote.isEmpty())return {};
+    const auto rate=m_server.bitrate()>0?QString::number(m_server.bitrate()):QStringLiteral("raw");
+    return source+"/"+(server.isEmpty()?QStringLiteral("server"):server)+"/"+remote+"/"+rate;
+  }
+  const auto id=track.value("videoId").toString();
+  if(id.isEmpty())return {};
+  return QStringLiteral("yt/")+id+"/"+streamingQuality();
+}
+QString Backend::streamedAudioDir(const QString &key) const {
+  QString path=audioStoreRoot();
+  for(const auto &part:key.split('/'))path+="/"+safeAudioSegment(part);
+  return path;
+}
+QString Backend::lookupStreamedAudio(const QString &key) const {
+  if(key.isEmpty()||!rememberStreamedAudio())return {};
+  QDir dir(streamedAudioDir(key));
+  if(!dir.exists())return {};
+  const auto files=dir.entryInfoList(QDir::Files|QDir::NoSymLinks,QDir::Time);
+  for(const auto &info:files){
+    if(info.isReadable()&&info.size()>0&&info.size()<=512LL*1024*1024)return info.canonicalFilePath();
+  }
+  return {};
+}
+void Backend::touchStreamedAudio(const QString &path) const {
+  QFile f(path);
+  if(f.open(QIODevice::ReadWrite))f.setFileTime(QDateTime::currentDateTimeUtc(),QFileDevice::FileModificationTime);
+}
+QString Backend::storeStreamedAudio(const QString &file, const QString &key) {
+  if(key.isEmpty()||!rememberStreamedAudio()||file.isEmpty())return {};
+  const QFileInfo info(file);
+  if(!info.isFile()||info.size()<=0)return {};
+  const auto dir=streamedAudioDir(key);
+  if(!QDir().mkpath(dir))return {};
+  QFile::setPermissions(audioStoreRoot(),QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner);
+  const auto dest=dir+"/"+info.fileName();
+  if(QFileInfo::exists(dest)&&QFileInfo(dest).canonicalFilePath()==info.canonicalFilePath()){
+    pruneStreamedAudio();
+    return info.canonicalFilePath();
+  }
+  QFile::remove(dest);
+  if(!QFile::rename(file,dest)&&!(QFile::copy(file,dest)&&QFile::remove(file)))return {};
+  QFile::setPermissions(dest,QFileDevice::ReadOwner|QFileDevice::WriteOwner);
+  pruneStreamedAudio();
+  return QFileInfo(dest).canonicalFilePath();
+}
+void Backend::pruneStreamedAudio() {
+  const qint64 cap=qint64(streamedAudioCacheMb())*1024*1024;
+  const auto root=audioStoreRoot();
+  if(!QFileInfo::exists(root))return;
+  struct Entry{QString path;qint64 mtime;qint64 size;};
+  QVector<Entry> files;
+  qint64 total=0;
+  QDirIterator it(root,QDir::Files|QDir::NoSymLinks,QDirIterator::Subdirectories);
+  while(it.hasNext()){
+    it.next();
+    const auto info=it.fileInfo();
+    files.push_back({info.absoluteFilePath(),info.lastModified().toMSecsSinceEpoch(),info.size()});
+    total+=info.size();
+  }
+  if(total<=cap)return;
+  std::sort(files.begin(),files.end(),[](const Entry &a,const Entry &b){return a.mtime<b.mtime;});
+  for(const auto &e:files){
+    if(total<=cap)break;
+    if(QFile::remove(e.path))total-=e.size;
+  }
+}
+QString Backend::playableAudioFile(const QString &file, const QVariantMap &track) {
+  if(file.isEmpty()||!QFileInfo(file).isFile())return {};
+  QString path=file;
+  if(rememberStreamedAudio()){
+    const auto stored=storeStreamedAudio(path,streamedAudioKey(track));
+    if(!stored.isEmpty()){path=stored;m_audioCache.reset();}
+  }
+  const QFileInfo info(path);
+  if(!info.isFile())return {};
+  const auto canonical=info.canonicalFilePath();
+  const auto store=QFileInfo(audioStoreRoot()).canonicalFilePath();
+  const bool inStore=!store.isEmpty()&&(canonical==store||canonical.startsWith(store+'/'));
+  const bool inTemp=m_audioCache&&info.canonicalPath()==QFileInfo(m_audioCache->path()).canonicalFilePath();
+  return (inStore||inTemp)?canonical:QString();
+}
 void Backend::resolveCurrent(bool retry) {
   if(isServerSource(current().value("source"))){
     cancelPreparation();cancel("play");m_recovering=false;m_resolving=true;
     if(!retry&&m_savedPosition>0)m_restorePosition=m_savedPosition;
+    if(!retry){
+      const auto hit=lookupStreamedAudio(streamedAudioKey(current()));
+      if(!hit.isEmpty()){
+        touchStreamedAudio(hit);m_audioCache.reset();
+        m_media().setSource(QUrl::fromLocalFile(hit));if(m_wantPlay)m_media().play();emit playbackChanged();return;
+      }
+    }
     m_audioCache=audioDirectory();
     if(!m_audioCache||!m_audioCache->isValid()){m_resolving=false;m_wantPlay=false;notifyError("Could not create the audio buffer.");emit playbackChanged();return;}
     const auto token=m_trackToken;const auto directory=m_audioCache;
     m_server.download(current(),directory->path()+"/song",[this,token,directory](const QVariantMap &data,const QString &error){
       if(token!=m_trackToken)return;
       if(!error.isEmpty()){m_resolving=false;m_wantPlay=false;notifyError(error,"play");emit playbackChanged();return;}
-      m_media().setSource(QUrl::fromLocalFile(data.value("file").toString()));if(m_wantPlay)m_media().play();emit playbackChanged();
+      auto file=data.value("file").toString();
+      const auto stored=playableAudioFile(file,current());
+      if(!stored.isEmpty())file=stored;
+      m_media().setSource(QUrl::fromLocalFile(file));if(m_wantPlay)m_media().play();emit playbackChanged();
     });emit playbackChanged();return;
   }
   if(!current().value("localPath").toString().isEmpty()) {
@@ -689,8 +804,8 @@ void Backend::resolveCurrent(bool retry) {
         }
     }
     auto url = QUrl(data.value("url").toString());
-    const auto file=data.value("file").toString();
-    if(!file.isEmpty() && m_audioCache && QFileInfo(file).isFile() && QFileInfo(file).canonicalPath()==QFileInfo(m_audioCache->path()).canonicalFilePath())url=QUrl::fromLocalFile(file);
+    const auto file=playableAudioFile(data.value("file").toString(),current());
+    if(!file.isEmpty())url=QUrl::fromLocalFile(file);
     if (url.scheme() != "https" && !url.isLocalFile()) {
       m_resolving = false;
       notifyError("The stream URL is invalid.");
@@ -716,6 +831,10 @@ void Backend::resolveCurrent(bool retry) {
       apply(cached);
       return;
     }
+  }
+  if(!retry){
+    const auto hit=lookupStreamedAudio(streamedAudioKey(current()));
+    if(!hit.isEmpty()){touchStreamedAudio(hit);apply({{"ok",true},{"file",hit}});return;}
   }
   if(!retry && m_media().source().isEmpty() && m_savedPosition>0)m_restorePosition=m_savedPosition;
   m_audioCache=audioDirectory();
@@ -1274,6 +1393,7 @@ void Backend::clearCache() {
   const auto p =
       QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/art";
   QDir(p).removeRecursively();
+  QDir(audioStoreRoot()).removeRecursively();
   m_streams.clear();
   emit artworkCacheCleared();
   emit toast("Cache cleared");
@@ -1980,6 +2100,13 @@ void Backend::updatePreparation(){
   const qint64 remaining=(duration()-position())/playbackRate();
   if(duration()<=0)return;
   if(remaining>45000){m_prepareTimer.start(int(qMin<qint64>(remaining-45000,2147483647)));return;}
+  if(rememberStreamedAudio()){
+    const auto hit=lookupStreamedAudio(QStringLiteral("yt/")+nextId+"/"+streamingQuality());
+    if(!hit.isEmpty()){
+      m_preparationAttempt=nextId;m_preparedData={{"ok",true},{"file",hit}};
+      touchStreamedAudio(hit);return;
+    }
+  }
   m_preparationAttempt=nextId;const auto generation=m_preparationGeneration;
   auto directory=audioDirectory();if(!directory||!directory->isValid())return;
   m_preparedDirectory=directory;
@@ -1988,8 +2115,13 @@ void Backend::updatePreparation(){
     const QFileInfo file(data.value("file").toString());
     // Preload failures and oversized/direct streams leave normal playback in charge.
     if(data.value("ok").toBool()&&file.isFile()&&file.size()<=32*1024*1024&&file.canonicalPath()==QFileInfo(directory->path()).canonicalFilePath()){
-      m_preparedData=data;
-      QFile buffered(file.filePath());if(buffered.open(QIODevice::ReadOnly))::posix_fadvise(buffered.handle(),0,0,POSIX_FADV_DONTNEED);
+      auto path=file.filePath();
+      if(rememberStreamedAudio()){
+        const auto stored=storeStreamedAudio(path,QStringLiteral("yt/")+nextId+"/"+streamingQuality());
+        if(!stored.isEmpty()){path=stored;m_preparedDirectory.reset();}
+      }
+      m_preparedData=data;m_preparedData["file"]=path;
+      QFile buffered(path);if(buffered.open(QIODevice::ReadOnly))::posix_fadvise(buffered.handle(),0,0,POSIX_FADV_DONTNEED);
     }
     else m_preparedDirectory.reset();
   },directory);
@@ -2502,6 +2634,8 @@ QUrl Backend::readySource(const QVariantMap &track) const {
     const QFileInfo file(local);
     return file.isFile() && file.isReadable() ? QUrl::fromLocalFile(file.absoluteFilePath()) : QUrl();
   }
+  const auto cached=lookupStreamedAudio(streamedAudioKey(track));
+  if(!cached.isEmpty())return QUrl::fromLocalFile(cached);
   const auto id=track.value("videoId").toString();
   if(id.isEmpty() || id!=m_preparedId || m_preparedData.isEmpty())return {};
   const auto file=m_preparedData.value("file").toString();
