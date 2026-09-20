@@ -87,7 +87,9 @@ option(SUNG_DIAGNOSTICS "Build the live UI verification harness" OFF)
 if(SUNG_DIAGNOSTICS)
  qt_add_executable(sung-artwork-fixture tests/artwork_fixture.cpp)
  target_link_libraries(sung-artwork-fixture PRIVATE Qt6::Core Qt6::Gui Qt6::Network)
- find_package(Qt6 REQUIRED COMPONENTS Test GuiPrivate)
+ # The Qt6GuiPrivate package is not shipped in binary Qt distributions; the
+ # Qt6::GuiPrivate target comes with the Gui component's targets file instead.
+ find_package(Qt6 REQUIRED COMPONENTS Test)
  target_sources(sung PRIVATE tests/uitest.cpp tests/immersive_test.cpp tests/immersive_edges.cpp tests/expressive_test.cpp tests/feature_test.cpp tests/tour.cpp tests/uitest.h tests/benchmark.cpp)
  target_include_directories(sung PRIVATE tests src)
  target_compile_definitions(sung PRIVATE SUNG_DIAGNOSTICS)
