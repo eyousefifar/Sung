@@ -44,9 +44,9 @@ ApplicationWindow {
     function openFileDialog(kind) {
         if(!fileDialogs) {
             const component=Qt.createComponent("FileDialogs.qml");
-            if(component.status===Component.Error){app.toast("Could not open the file picker.");if(kind==="folder")window.returnToFolderEntry();return;}
+            if(component.status===Component.Error){console.error(component.errorString());app.toast("Could not open the file picker.");if(kind==="folder")window.returnToFolderEntry();return;}
             fileDialogs=component.createObject(window,{ownerWindow:window});
-            if(!fileDialogs){app.toast("Could not open the file picker.");if(kind==="folder")window.returnToFolderEntry();return;}
+            if(!fileDialogs){console.error(component.errorString());app.toast("Could not open the file picker.");if(kind==="folder")window.returnToFolderEntry();return;}
         }
         fileDialogs.open(kind);
         if(kind!=="folder")return;
