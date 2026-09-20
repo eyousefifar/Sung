@@ -11,7 +11,8 @@ need() { command -v "$1" >/dev/null || { echo "Missing command: $1 (install Rust
 need git
 need cargo
 
-if [[ -x "$out" ]]; then
+stamp="$root/.deps/ejs/commit"
+if [[ -x "$out" && -f "$stamp" && "$(cat -- "$stamp")" == "$commit" ]]; then
   printf 'Using existing %s\n' "$out"
 else
   mkdir -p "$(dirname "$src")"
@@ -40,6 +41,7 @@ PY
   [[ -x "$bin" ]] || { echo "ejs binary not found after cargo build" >&2; exit 1; }
   cp -a -- "$bin" "$out"
   chmod 0755 "$out"
+  printf '%s\n' "$commit" >"$stamp"
 fi
 cp -a -- "$out" "$helper"
 chmod 0755 "$helper"
