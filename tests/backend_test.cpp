@@ -501,6 +501,20 @@ private slots:
     auto other=track("cache000002");
     b.stop();b.playItem(other);QTRY_VERIFY_WITH_TIMEOUT(b.playing()&&!b.resolving(),10000);
     QVERIFY(!QFile::exists(pad.fileName()));
+    QTemporaryDir scratch;
+    QFile escape(scratch.filePath("song"));QVERIFY(escape.open(QIODevice::WriteOnly));QCOMPARE(escape.write("ok"),qint64(2));escape.close();
+    const auto escaped=b.storeStreamedAudio(escape.fileName(),"jellyfin/acct/../../../evil/raw");
+    QVERIFY(!escaped.isEmpty());
+    const auto storeRoot=QFileInfo(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)+"/audio-store").canonicalFilePath();
+    QVERIFY(QFileInfo(escaped).canonicalFilePath().startsWith(storeRoot+'/'));
+    QVERIFY(!QFileInfo(escaped).canonicalFilePath().contains("/evil/"));
+    QFile oversized(scratch.filePath("huge.bin"));QVERIFY(oversized.open(QIODevice::WriteOnly));QCOMPARE(oversized.write(QByteArray(70*1024*1024,'y')),qint64(70*1024*1024));oversized.close();
+    QCOMPARE(b.storeStreamedAudio(oversized.fileName(),"yt/cache000099/standard"),QString());
+    QVERIFY(QFile::exists(oversized.fileName()));
+    b.stop();b.m_savedPosition=12000;b.m_media().setSource({});b.m_wantPlay=true;
+    b.resolveCurrent(false);QCOMPARE(b.m_restorePosition,qint64(12000));
+    b.m_preparedData={{"ok",true},{"file",first.toLocalFile()}};b.m_preparedId="cache000001";
+    b.clearCache();QVERIFY(b.m_preparedData.isEmpty());QVERIFY(b.m_preparedId.isEmpty());
     b.stop();b.clearQueue();b.setStreamedAudioCacheMb(512);
   }
   void searchAndBulkOperations() {

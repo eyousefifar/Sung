@@ -745,9 +745,10 @@ private:
   QString streamedAudioDir(const QString &key) const;
   QString lookupStreamedAudio(const QString &key) const;
   QString storeStreamedAudio(const QString &file, const QString &key);
-  QString playableAudioFile(const QString &file, const QVariantMap &track);
+  QString playableAudioFile(const QString &file, const QString &key);
   void touchStreamedAudio(const QString &path) const;
-  void pruneStreamedAudio();
+  void pruneStreamedAudio(const QString &keep = {});
+  quint64 m_audioStoreGeneration=0;
   QVariantMap m_preparedData;
   QString m_preparedId, m_preparationAttempt;
   quint64 m_preparationGeneration=0;

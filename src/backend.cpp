@@ -13,6 +13,7 @@
 #include <queue>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -44,9 +45,10 @@ static std::shared_ptr<QTemporaryDir> audioDirectory() {
 static QString audioStoreRoot() {
   return QStandardPaths::writableLocation(QStandardPaths::CacheLocation)+"/audio-store";
 }
-static QString safeAudioSegment(QString s) {
-  for(QChar &c:s)if(!(c.isLetterOrNumber()||c==QLatin1Char('-')||c==QLatin1Char('_')||c==QLatin1Char('.')))c=QLatin1Char('_');
-  return s.isEmpty()?QStringLiteral("_"):s;
+static bool underAudioStore(const QString &path) {
+  const auto root=QFileInfo(audioStoreRoot()).canonicalFilePath();
+  const auto canon=QFileInfo(path).canonicalFilePath();
+  return !root.isEmpty()&&!canon.isEmpty()&&(canon==root||canon.startsWith(root+'/'));
 }
 static QString itemId(const QVariant &v) {
   return v.toMap().value("id").toString();
@@ -671,9 +673,7 @@ QString Backend::streamedAudioKey(const QVariantMap &track) const {
   return QStringLiteral("yt/")+id+"/"+streamingQuality();
 }
 QString Backend::streamedAudioDir(const QString &key) const {
-  QString path=audioStoreRoot();
-  for(const auto &part:key.split('/'))path+="/"+safeAudioSegment(part);
-  return path;
+  return audioStoreRoot()+"/"+QCryptographicHash::hash(key.toUtf8(),QCryptographicHash::Sha256).toHex();
 }
 QString Backend::lookupStreamedAudio(const QString &key) const {
   if(key.isEmpty()||!rememberStreamedAudio())return {};
@@ -693,24 +693,40 @@ QString Backend::storeStreamedAudio(const QString &file, const QString &key) {
   if(key.isEmpty()||!rememberStreamedAudio()||file.isEmpty())return {};
   const QFileInfo info(file);
   if(!info.isFile()||info.size()<=0)return {};
+  const qint64 cap=qint64(streamedAudioCacheMb())*1024*1024;
+  if(info.size()>cap)return {};
+  const auto root=audioStoreRoot();
+  if(!QDir().mkpath(root))return {};
+  QFile::setPermissions(root,QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner);
   const auto dir=streamedAudioDir(key);
   if(!QDir().mkpath(dir))return {};
-  QFile::setPermissions(audioStoreRoot(),QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner);
-  const auto dest=dir+"/"+info.fileName();
+  const auto dirCanon=QFileInfo(dir).canonicalFilePath();
+  if(!underAudioStore(dirCanon))return {};
+  const auto dest=dirCanon+"/"+info.fileName();
   if(QFileInfo::exists(dest)&&QFileInfo(dest).canonicalFilePath()==info.canonicalFilePath()){
-    pruneStreamedAudio();
+    pruneStreamedAudio(dest);
     return info.canonicalFilePath();
   }
   QFile::remove(dest);
   if(!QFile::rename(file,dest)&&!(QFile::copy(file,dest)&&QFile::remove(file)))return {};
   QFile::setPermissions(dest,QFileDevice::ReadOwner|QFileDevice::WriteOwner);
-  pruneStreamedAudio();
+  pruneStreamedAudio(dest);
+  if(!QFileInfo::exists(dest)||!underAudioStore(dest))return {};
   return QFileInfo(dest).canonicalFilePath();
 }
-void Backend::pruneStreamedAudio() {
+void Backend::pruneStreamedAudio(const QString &keep) {
   const qint64 cap=qint64(streamedAudioCacheMb())*1024*1024;
   const auto root=audioStoreRoot();
   if(!QFileInfo::exists(root))return;
+  QSet<QString> protectedPaths;
+  auto protect=[&](const QString &path){
+    const auto canon=QFileInfo(path).canonicalFilePath();
+    if(!canon.isEmpty())protectedPaths.insert(canon);
+  };
+  protect(keep);
+  if(m_media().source().isLocalFile())protect(m_media().source().toLocalFile());
+  if(spareDeck().source().isLocalFile())protect(spareDeck().source().toLocalFile());
+  protect(m_preparedData.value("file").toString());
   struct Entry{QString path;qint64 mtime;qint64 size;};
   QVector<Entry> files;
   qint64 total=0;
@@ -725,21 +741,22 @@ void Backend::pruneStreamedAudio() {
   std::sort(files.begin(),files.end(),[](const Entry &a,const Entry &b){return a.mtime<b.mtime;});
   for(const auto &e:files){
     if(total<=cap)break;
+    const auto canon=QFileInfo(e.path).canonicalFilePath();
+    if(protectedPaths.contains(canon)||protectedPaths.contains(e.path))continue;
     if(QFile::remove(e.path))total-=e.size;
   }
 }
-QString Backend::playableAudioFile(const QString &file, const QVariantMap &track) {
+QString Backend::playableAudioFile(const QString &file, const QString &key) {
   if(file.isEmpty()||!QFileInfo(file).isFile())return {};
   QString path=file;
   if(rememberStreamedAudio()){
-    const auto stored=storeStreamedAudio(path,streamedAudioKey(track));
-    if(!stored.isEmpty()){path=stored;m_audioCache.reset();}
+    const auto stored=storeStreamedAudio(path,key);
+    if(!stored.isEmpty()&&QFileInfo::exists(stored)){path=stored;m_audioCache.reset();}
   }
   const QFileInfo info(path);
   if(!info.isFile())return {};
   const auto canonical=info.canonicalFilePath();
-  const auto store=QFileInfo(audioStoreRoot()).canonicalFilePath();
-  const bool inStore=!store.isEmpty()&&(canonical==store||canonical.startsWith(store+'/'));
+  const bool inStore=underAudioStore(canonical);
   const bool inTemp=m_audioCache&&info.canonicalPath()==QFileInfo(m_audioCache->path()).canonicalFilePath();
   return (inStore||inTemp)?canonical:QString();
 }
@@ -757,12 +774,16 @@ void Backend::resolveCurrent(bool retry) {
     m_audioCache=audioDirectory();
     if(!m_audioCache||!m_audioCache->isValid()){m_resolving=false;m_wantPlay=false;notifyError("Could not create the audio buffer.");emit playbackChanged();return;}
     const auto token=m_trackToken;const auto directory=m_audioCache;
-    m_server.download(current(),directory->path()+"/song",[this,token,directory](const QVariantMap &data,const QString &error){
+    const auto key=streamedAudioKey(current());
+    const auto storeGen=m_audioStoreGeneration;
+    m_server.download(current(),directory->path()+"/song",[this,token,directory,key,storeGen](const QVariantMap &data,const QString &error){
       if(token!=m_trackToken)return;
       if(!error.isEmpty()){m_resolving=false;m_wantPlay=false;notifyError(error,"play");emit playbackChanged();return;}
       auto file=data.value("file").toString();
-      const auto stored=playableAudioFile(file,current());
-      if(!stored.isEmpty())file=stored;
+      if(storeGen==m_audioStoreGeneration){
+        const auto stored=playableAudioFile(file,key);
+        if(!stored.isEmpty())file=stored;
+      }
       m_media().setSource(QUrl::fromLocalFile(file));if(m_wantPlay)m_media().play();emit playbackChanged();
     });emit playbackChanged();return;
   }
@@ -782,7 +803,10 @@ void Backend::resolveCurrent(bool retry) {
   m_stopped=false;
   m_resolving = true;
   emit playbackChanged();
-  auto apply = [this, id](const QVariantMap &data) {
+  if(!retry && m_media().source().isEmpty() && m_savedPosition>0)m_restorePosition=m_savedPosition;
+  const auto key=streamedAudioKey(current());
+  const auto storeGen=m_audioStoreGeneration;
+  auto apply = [this, id, key, storeGen](const QVariantMap &data) {
     if (current().value("videoId").toString() != id)
       return;
     if (!data.value("ok").toBool()) {
@@ -804,8 +828,8 @@ void Backend::resolveCurrent(bool retry) {
         }
     }
     auto url = QUrl(data.value("url").toString());
-    const auto file=playableAudioFile(data.value("file").toString(),current());
-    if(!file.isEmpty())url=QUrl::fromLocalFile(file);
+    const auto file=storeGen==m_audioStoreGeneration?playableAudioFile(data.value("file").toString(),key):data.value("file").toString();
+    if(!file.isEmpty()&&QFileInfo(file).isFile())url=QUrl::fromLocalFile(file);
     if (url.scheme() != "https" && !url.isLocalFile()) {
       m_resolving = false;
       notifyError("The stream URL is invalid.");
@@ -833,10 +857,9 @@ void Backend::resolveCurrent(bool retry) {
     }
   }
   if(!retry){
-    const auto hit=lookupStreamedAudio(streamedAudioKey(current()));
+    const auto hit=lookupStreamedAudio(key);
     if(!hit.isEmpty()){touchStreamedAudio(hit);apply({{"ok",true},{"file",hit}});return;}
   }
-  if(!retry && m_media().source().isEmpty() && m_savedPosition>0)m_restorePosition=m_savedPosition;
   m_audioCache=audioDirectory();
   if(!m_audioCache||!m_audioCache->isValid()){m_resolving=false;m_wantPlay=false;notifyError("Could not create the audio buffer.");emit playbackChanged();return;}
   request("play", {{"op", "buffer"}, {"id", id}, {"cookies", cookies()}, {"quality", streamingQuality()},
@@ -1393,6 +1416,8 @@ void Backend::clearCache() {
   const auto p =
       QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/art";
   QDir(p).removeRecursively();
+  ++m_audioStoreGeneration;
+  cancelPreparation();
   QDir(audioStoreRoot()).removeRecursively();
   m_streams.clear();
   emit artworkCacheCleared();
@@ -2108,16 +2133,18 @@ void Backend::updatePreparation(){
     }
   }
   m_preparationAttempt=nextId;const auto generation=m_preparationGeneration;
+  const auto key=QStringLiteral("yt/")+nextId+"/"+streamingQuality();
+  const auto storeGen=m_audioStoreGeneration;
   auto directory=audioDirectory();if(!directory||!directory->isValid())return;
   m_preparedDirectory=directory;
-  request("prepare",{{"op","buffer"},{"id",nextId},{"directory",directory->path()},{"cookies",cookies()},{"quality",streamingQuality()}},[this,generation,nextId,directory](const QVariantMap &data){
+  request("prepare",{{"op","buffer"},{"id",nextId},{"directory",directory->path()},{"cookies",cookies()},{"quality",streamingQuality()}},[this,generation,nextId,directory,key,storeGen](const QVariantMap &data){
     if(generation!=m_preparationGeneration||m_preparedId!=nextId)return;
     const QFileInfo file(data.value("file").toString());
     // Preload failures and oversized/direct streams leave normal playback in charge.
     if(data.value("ok").toBool()&&file.isFile()&&file.size()<=32*1024*1024&&file.canonicalPath()==QFileInfo(directory->path()).canonicalFilePath()){
       auto path=file.filePath();
-      if(rememberStreamedAudio()){
-        const auto stored=storeStreamedAudio(path,QStringLiteral("yt/")+nextId+"/"+streamingQuality());
+      if(rememberStreamedAudio()&&storeGen==m_audioStoreGeneration){
+        const auto stored=storeStreamedAudio(path,key);
         if(!stored.isEmpty()){path=stored;m_preparedDirectory.reset();}
       }
       m_preparedData=data;m_preparedData["file"]=path;
